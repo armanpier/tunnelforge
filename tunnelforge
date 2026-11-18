@@ -1,0 +1,944 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# TunnelForge - High-Performance Reverse Tunnel & 3X-UI Bridge Suite
+# Author: Arman Pier (@armanpier)
+# License: MIT
+# Repository: https://github.com/armanpier/TunnelForge
+# ==============================================================================
+
+set -e
+
+VERSION="1.0.0"
+CONF_DIR="/etc/tunnelforge"
+CONF_FILE="/etc/tunnelforge/config.env"
+GOST_BIN="/usr/local/bin/gost"
+SERVICE_SERVER="tunnelforge-server.service"
+SERVICE_CLIENT="tunnelforge-client.service"
+XUI_DB="/etc/x-ui/x-ui.db"
+
+# Color Codes
+C_RESET="\033[0m"
+C_RED="\033[1;31m"
+C_GREEN="\033[1;32m"
+C_YELLOW="\033[1;33m"
+C_BLUE="\033[1;34m"
+C_MAGENTA="\033[1;35m"
+C_CYAN="\033[1;36m"
+C_BOLD="\033[1m"
+C_DIM="\033[2m"
+
+# Print Helpers
+info()    { echo -e "${C_CYAN}[INFO]${C_RESET} $*"; }
+success() { echo -e "${C_GREEN}[SUCCESS]${C_RESET} $*"; }
+warn()    { echo -e "${C_YELLOW}[WARN]${C_RESET} $*"; }
+error()   { echo -e "${C_RED}[ERROR]${C_RESET} $*"; }
+title()   { echo -e "\n${C_BOLD}${C_MAGENTA}>>> $*${C_RESET}"; }
+
+# Root Privilege Check
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        error "This script must be run as root. Please run with sudo or as root user."
+        exit 1
+    fi
+}
+
+# Architecture Detection
+detect_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64) echo "linux_amd64" ;;
+        aarch64|arm64) echo "linux_arm64" ;;
+        armv7*|armhf) echo "linux_armv7" ;;
+        i386|i686) echo "linux_386" ;;
+        *)
+            error "Unsupported CPU architecture: $arch"
+            exit 1
+            ;;
+    esac
+}
+
+# Dependency Installation
+install_deps() {
+    local pkgs=()
+    command -v curl >/dev/null 2>&1 || pkgs+=(curl)
+    command -v tar >/dev/null 2>&1 || pkgs+=(tar)
+    command -v python3 >/dev/null 2>&1 || pkgs+=(python3)
+    command -v ufw >/dev/null 2>&1 || pkgs+=(ufw)
+
+    if [[ ${#pkgs[@]} -gt 0 ]]; then
+        info "Installing required packages: ${pkgs[*]}..."
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -y && apt-get install -y "${pkgs[@]}"
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y "${pkgs[@]}"
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y "${pkgs[@]}"
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman -Sy --noconfirm "${pkgs[@]}"
+        fi
+    fi
+}
+
+# Ensure GOST Core Binary is Installed
+install_gost() {
+    if [[ -x "$GOST_BIN" ]]; then
+        local cur_ver
+        cur_ver=$("$GOST_BIN" -V 2>/dev/null || echo "installed")
+        info "GOST core is already available: ${cur_ver}"
+        return 0
+    fi
+
+    info "Fetching latest GOST v3 core release from GitHub..."
+    local arch
+    arch=$(detect_arch)
+    local tag
+    tag=$(curl -sSL "https://api.github.com/repos/go-gost/gost/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || echo "")
+    if [[ -z "$tag" ]]; then
+        tag="v3.3.3"
+    fi
+    local ver_clean="${tag#v}"
+
+    local download_url="https://github.com/go-gost/gost/releases/download/${tag}/gost_${ver_clean}_${arch}.tar.gz"
+    info "Downloading GOST ${tag} (${arch}) from ${download_url}..."
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    if ! curl -sSL "$download_url" -o "${tmp_dir}/gost.tar.gz"; then
+        error "Failed to download GOST archive. Please check your internet connection."
+        rm -rf "$tmp_dir"
+        exit 1
+    fi
+
+    tar -xzf "${tmp_dir}/gost.tar.gz" -C "$tmp_dir"
+    if [[ -f "${tmp_dir}/gost" ]]; then
+        mv "${tmp_dir}/gost" "$GOST_BIN"
+        chmod +x "$GOST_BIN"
+        success "GOST core installed successfully to $GOST_BIN"
+    else
+        error "Failed to extract GOST binary from archive."
+        rm -rf "$tmp_dir"
+        exit 1
+    fi
+    rm -rf "$tmp_dir"
+}
+
+# Banner
+show_banner() {
+    clear
+    echo -e "${C_CYAN}${C_BOLD}"
+    cat << "EOF"
+  _____                       _ _____                    
+ |_   _|   _ _ __  _ __   ___| |  ___|__  _ __ __ _  ___ 
+   | || | | | '_ \| '_ \ / _ \ | |_ / _ \| '__/ _` |/ _ \
+   | || |_| | | | | | | |  __/ |  _| (_) | | | (_| |  __/
+   |_| \__,_|_| |_|_| |_|\___|_|_|  \___/|_|  \__, |\___|
+                                              |___/      
+EOF
+    echo -e "${C_RESET}"
+    echo -e " ${C_BOLD}TunnelForge v${VERSION}${C_RESET} — High-Speed Anti-Censorship Reverse Tunnel & 3X-UI Suite"
+    echo -e " ${C_DIM}Core: GOST v3 (MWSS / TLS / gRPC) | Author: @armanpier${C_RESET}"
+    echo -e "${C_CYAN}========================================================================${C_RESET}"
+    echo ""
+}
+
+# Get Public IP
+get_public_ip() {
+    local ip
+    ip=$(curl -s4m 5 https://api.ipify.org || curl -s4m 5 https://ifconfig.me || curl -s4m 5 https://icanhazip.com || echo "Unknown")
+    echo "$ip"
+}
+
+# ------------------------------------------------------------------------------
+# 1. SETUP FOREIGN SERVER (DESTINATION)
+# ------------------------------------------------------------------------------
+setup_foreign_server() {
+    title "Configure Foreign Server (Tunnel Exit / Server Mode)"
+    install_deps
+    install_gost
+    mkdir -p "$CONF_DIR"
+
+    local my_ip
+    my_ip=$(get_public_ip)
+    echo -e "Detected Server Public IP: ${C_GREEN}${my_ip}${C_RESET}"
+    echo ""
+
+    read -rp "Enter Tunnel Listen Port [Default: 28030]: " tunnel_port
+    tunnel_port=${tunnel_port:-28030}
+
+    echo ""
+    echo "Select Tunnel Transport Protocol:"
+    echo "  1) Multi-WebSocket + TLS (relay+mwss) [RECOMMENDED - Best Anti-DPI & Censorship Bypass]"
+    echo "  2) Direct TLS Relay (relay+tls)       [Fastest Raw Throughput for clean networks]"
+    echo "  3) gRPC Multiplex Relay (relay+grpc)  [HTTP/2 Multiplexing]"
+    echo "  4) Dual Mode (Listen on both MWSS & TLS)"
+    read -rp "Select protocol [1-4, Default: 1]: " proto_choice
+    proto_choice=${proto_choice:-1}
+
+    local proto_scheme="relay+mwss"
+    local gost_args=()
+    case "$proto_choice" in
+        1)
+            proto_scheme="relay+mwss"
+            gost_args=("-L" "${proto_scheme}://0.0.0.0:${tunnel_port}")
+            ;;
+        2)
+            proto_scheme="relay+tls"
+            gost_args=("-L" "${proto_scheme}://0.0.0.0:${tunnel_port}")
+            ;;
+        3)
+            proto_scheme="relay+grpc"
+            gost_args=("-L" "${proto_scheme}://0.0.0.0:${tunnel_port}")
+            ;;
+        4)
+            read -rp "Enter Secondary TLS Port [Default: 28020]: " tls_port
+            tls_port=${tls_port:-28020}
+            proto_scheme="relay+mwss"
+            gost_args=("-L" "relay+mwss://0.0.0.0:${tunnel_port}" "-L" "relay+tls://0.0.0.0:${tls_port}")
+            ;;
+        *)
+            proto_scheme="relay+mwss"
+            gost_args=("-L" "${proto_scheme}://0.0.0.0:${tunnel_port}")
+            ;;
+    esac
+
+    echo ""
+    read -rp "Enable Tunnel Authentication (Username:Password)? [y/N]: " auth_enable
+    local auth_str=""
+    if [[ "$auth_enable" =~ ^[Yy]$ ]]; then
+        read -rp "Enter Username: " auth_user
+        read -rp "Enter Password: " auth_pass
+        if [[ -n "$auth_user" && -n "$auth_pass" ]]; then
+            auth_str="${auth_user}:${auth_pass}@"
+            # Reconstruct with auth
+            gost_args=()
+            if [[ "$proto_choice" -eq 4 ]]; then
+                gost_args=("-L" "relay+mwss://${auth_str}0.0.0.0:${tunnel_port}" "-L" "relay+tls://${auth_str}0.0.0.0:${tls_port}")
+            else
+                gost_args=("-L" "${proto_scheme}://${auth_str}0.0.0.0:${tunnel_port}")
+            fi
+        fi
+    fi
+
+    # Save Config
+    cat > "$CONF_FILE" << EOF
+ROLE="server"
+SERVER_IP="${my_ip}"
+TUNNEL_PORT="${tunnel_port}"
+PROTO_SCHEME="${proto_scheme}"
+AUTH_STR="${auth_str}"
+GOST_ARGS="${gost_args[*]}"
+EOF
+
+    # Create Systemd Service
+    cat > "/etc/systemd/system/${SERVICE_SERVER}" << EOF
+[Unit]
+Description=TunnelForge Reverse Tunnel Server (GOST)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=${GOST_BIN} ${gost_args[*]}
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable "${SERVICE_SERVER}" >/dev/null 2>&1
+    systemctl restart "${SERVICE_SERVER}"
+
+    # Open Firewall Port if UFW is active
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+        info "Opening tunnel port ${tunnel_port}/tcp on UFW..."
+        ufw allow "${tunnel_port}/tcp" >/dev/null 2>&1
+        if [[ "$proto_choice" -eq 4 && -n "${tls_port}" ]]; then
+            ufw allow "${tls_port}/tcp" >/dev/null 2>&1
+        fi
+    fi
+
+    echo ""
+    success "TunnelForge Server is now active and listening on port ${tunnel_port}!"
+    echo -e "${C_CYAN}------------------------------------------------------------------------${C_RESET}"
+    echo -e " ${C_BOLD}NEXT STEP: RUN THIS ON YOUR IRAN / CLIENT SERVER:${C_RESET}"
+    echo ""
+    echo -e " 1) Run TunnelForge on Iran VPS:"
+    echo -e "    ${C_YELLOW}tunnel${C_RESET}"
+    echo -e " 2) Select: ${C_BOLD}[2] Setup Iran Server (Bridge / Forwarder Mode)${C_RESET}"
+    echo -e " 3) When asked, provide:"
+    echo -e "    - Foreign Server IP:   ${C_GREEN}${my_ip}${C_RESET}"
+    echo -e "    - Tunnel Port:         ${C_GREEN}${tunnel_port}${C_RESET}"
+    echo -e "    - Protocol:            ${C_GREEN}${proto_scheme}${C_RESET}"
+    if [[ -n "$auth_str" ]]; then
+        echo -e "    - Auth Credentials:    ${C_GREEN}${auth_user}:${auth_pass}${C_RESET}"
+    fi
+    echo -e "${C_CYAN}------------------------------------------------------------------------${C_RESET}"
+    read -rp "Press Enter to return to menu..."
+}
+
+# ------------------------------------------------------------------------------
+# 2. SETUP IRAN SERVER (CLIENT / BRIDGE)
+# ------------------------------------------------------------------------------
+setup_iran_client() {
+    title "Configure Iran Server (Bridge / Forwarder Mode)"
+    install_deps
+    install_gost
+    mkdir -p "$CONF_DIR"
+
+    local my_ip
+    my_ip=$(get_public_ip)
+    echo -e "Detected Iran Server Public IP: ${C_GREEN}${my_ip}${C_RESET}"
+    echo ""
+
+    read -rp "Enter Foreign Server IP: " remote_ip
+    while [[ -z "$remote_ip" ]]; do
+        warn "Foreign Server IP cannot be empty!"
+        read -rp "Enter Foreign Server IP: " remote_ip
+    done
+
+    read -rp "Enter Foreign Tunnel Port [Default: 28030]: " tunnel_port
+    tunnel_port=${tunnel_port:-28030}
+
+    echo ""
+    echo "Select Tunnel Transport Protocol (Must match Foreign Server):"
+    echo "  1) Multi-WebSocket + TLS (relay+mwss) [RECOMMENDED]"
+    echo "  2) Direct TLS Relay (relay+tls)"
+    echo "  3) gRPC Multiplex Relay (relay+grpc)"
+    read -rp "Select protocol [1-3, Default: 1]: " proto_choice
+    proto_choice=${proto_choice:-1}
+
+    local proto_scheme="relay+mwss"
+    case "$proto_choice" in
+        1) proto_scheme="relay+mwss" ;;
+        2) proto_scheme="relay+tls" ;;
+        3) proto_scheme="relay+grpc" ;;
+        *) proto_scheme="relay+mwss" ;;
+    esac
+
+    echo ""
+    read -rp "Did you enable authentication on the Foreign Server? [y/N]: " auth_enable
+    local auth_str=""
+    if [[ "$auth_enable" =~ ^[Yy]$ ]]; then
+        read -rp "Enter Username: " auth_user
+        read -rp "Enter Password: " auth_pass
+        if [[ -n "$auth_user" && -n "$auth_pass" ]]; then
+            auth_str="${auth_user}:${auth_pass}@"
+        fi
+    fi
+
+    echo ""
+    echo -e "${C_BOLD}Port Forwarding Configuration:${C_RESET}"
+    echo "Specify the port(s) on Iran VPS to forward through the tunnel to Foreign VPS."
+    echo "Example: 8443 or multiple ports separated by comma: 8443, 443, 2082"
+    read -rp "Enter Port(s) to forward [Default: 8443]: " user_ports
+    user_ports=${user_ports:-8443}
+
+    # Format gost forwarding arguments
+    IFS=',' read -ra PORT_ARR <<< "$user_ports"
+    local forward_args=()
+    local clean_ports=()
+    for p in "${PORT_ARR[@]}"; do
+        p=$(echo "$p" | tr -d ' ')
+        if [[ "$p" =~ ^[0-9]+$ ]]; then
+            forward_args+=("-L" "tcp://0.0.0.0:${p}/127.0.0.1:${p}")
+            forward_args+=("-L" "udp://0.0.0.0:${p}/127.0.0.1:${p}")
+            clean_ports+=("$p")
+        fi
+    done
+
+    if [[ ${#forward_args[@]} -eq 0 ]]; then
+        error "No valid ports provided!"
+        return 1
+    fi
+
+    local forwarder_url="${proto_scheme}://${auth_str}${remote_ip}:${tunnel_port}"
+    local gost_cmd="${GOST_BIN} ${forward_args[*]} -F ${forwarder_url}"
+
+    # Save Config
+    cat > "$CONF_FILE" << EOF
+ROLE="client"
+IRAN_IP="${my_ip}"
+REMOTE_IP="${remote_ip}"
+TUNNEL_PORT="${tunnel_port}"
+PROTO_SCHEME="${proto_scheme}"
+AUTH_STR="${auth_str}"
+PORTS="${clean_ports[*]}"
+GOST_CMD="${gost_cmd}"
+EOF
+
+    # Create Systemd Service
+    cat > "/etc/systemd/system/${SERVICE_CLIENT}" << EOF
+[Unit]
+Description=TunnelForge Reverse Tunnel Client (GOST)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=${gost_cmd}
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable "${SERVICE_CLIENT}" >/dev/null 2>&1
+    systemctl restart "${SERVICE_CLIENT}"
+
+    # Firewall hardening prompt
+    echo ""
+    read -rp "Harden Iran VPS Firewall now (Allow only SSH and forwarded ports)? [Y/n]: " ufw_lock
+    ufw_lock=${ufw_lock:-y}
+    if [[ "$ufw_lock" =~ ^[Yy]$ ]]; then
+        harden_iran_firewall "${clean_ports[@]}"
+    fi
+
+    echo ""
+    success "TunnelForge Client is active and forwarding traffic to Foreign VPS!"
+    echo -e "Forwarded Ports on Iran VPS: ${C_GREEN}${clean_ports[*]}${C_RESET}"
+    echo -e "Remote Destination:         ${C_GREEN}${remote_ip}:${tunnel_port}${C_RESET} (${proto_scheme})"
+    echo ""
+    read -rp "Press Enter to return to menu..."
+}
+
+# ------------------------------------------------------------------------------
+# 3. PORT FORWARDING MANAGER
+# ------------------------------------------------------------------------------
+manage_ports() {
+    title "Manage Forwarded Ports (Client Mode)"
+    if [[ ! -f "$CONF_FILE" ]]; then
+        error "No existing TunnelForge client configuration found. Please setup Iran Client first."
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+
+    # shellcheck source=/dev/null
+    source "$CONF_FILE"
+    if [[ "$ROLE" != "client" ]]; then
+        error "Port management is only applicable on Iran Client mode."
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+
+    echo -e "Current Forwarded Ports: ${C_GREEN}${PORTS}${C_RESET}"
+    echo ""
+    echo "  1) Add Port"
+    echo "  2) Remove Port"
+    echo "  3) Replace All Ports"
+    echo "  0) Back to Main Menu"
+    read -rp "Select option [0-3]: " opt
+
+    local cur_ports=($PORTS)
+    case "$opt" in
+        1)
+            read -rp "Enter port number to add (e.g. 2082): " new_p
+            if [[ "$new_p" =~ ^[0-9]+$ ]]; then
+                cur_ports+=("$new_p")
+            fi
+            ;;
+        2)
+            read -rp "Enter port number to remove: " rem_p
+            local new_list=()
+            for p in "${cur_ports[@]}"; do
+                if [[ "$p" != "$rem_p" ]]; then
+                    new_list+=("$p")
+                fi
+            done
+            cur_ports=("${new_list[@]}")
+            ;;
+        3)
+            read -rp "Enter new ports comma-separated (e.g. 8443, 443): " repl_p
+            IFS=',' read -ra P_ARR <<< "$repl_p"
+            cur_ports=()
+            for p in "${P_ARR[@]}"; do
+                p=$(echo "$p" | tr -d ' ')
+                [[ "$p" =~ ^[0-9]+$ ]] && cur_ports+=("$p")
+            done
+            ;;
+        0) return 0 ;;
+        *) return 0 ;;
+    esac
+
+    # Deduplicate
+    local unique_ports=($(echo "${cur_ports[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+    local forward_args=()
+    for p in "${unique_ports[@]}"; do
+        forward_args+=("-L" "tcp://0.0.0.0:${p}/127.0.0.1:${p}")
+        forward_args+=("-L" "udp://0.0.0.0:${p}/127.0.0.1:${p}")
+    done
+
+    local forwarder_url="${PROTO_SCHEME}://${AUTH_STR}${REMOTE_IP}:${TUNNEL_PORT}"
+    local gost_cmd="${GOST_BIN} ${forward_args[*]} -F ${forwarder_url}"
+
+    # Update config file
+    sed -i "s|^PORTS=.*|PORTS=\"${unique_ports[*]}\"|" "$CONF_FILE"
+    sed -i "s|^GOST_CMD=.*|GOST_CMD=\"${gost_cmd}\"|" "$CONF_FILE"
+
+    # Update systemd service
+    cat > "/etc/systemd/system/${SERVICE_CLIENT}" << EOF
+[Unit]
+Description=TunnelForge Reverse Tunnel Client (GOST)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=${gost_cmd}
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl restart "${SERVICE_CLIENT}"
+    success "Updated forwarded ports: ${unique_ports[*]}"
+
+    # Update UFW if active
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+        for p in "${unique_ports[@]}"; do
+            ufw allow "${p}/tcp" >/dev/null 2>&1
+            ufw allow "${p}/udp" >/dev/null 2>&1
+        done
+        success "Firewall rules updated for ports: ${unique_ports[*]}"
+    fi
+
+    read -rp "Press Enter to return to menu..."
+}
+
+# ------------------------------------------------------------------------------
+# 4. 3X-UI / X-UI SUBSCRIPTION AUTO-FIX
+# ------------------------------------------------------------------------------
+sync_xui_subscription() {
+    title "3X-UI / X-UI Subscription Auto-Sync"
+
+    if [[ ! -f "$XUI_DB" ]]; then
+        error "3X-UI database not found at ${XUI_DB}."
+        echo "Make sure 3X-UI is installed on this server."
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+
+    python3 - << 'EOF'
+import sqlite3
+import sys
+
+db_path = "/etc/x-ui/x-ui.db"
+try:
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("SELECT id, port, protocol, remark, tag, share_addr_strategy, share_addr FROM inbounds WHERE enable = 1")
+    rows = c.fetchall()
+    if not rows:
+        print("[!] No active inbounds found in 3X-UI database.")
+        sys.exit(0)
+
+    print("\n--- Current Active Inbounds in 3X-UI ---")
+    print(f"{'ID':<4} {'Port':<7} {'Protocol':<8} {'Remark':<18} {'Share Strategy':<15} {'Share Address'}")
+    print("-" * 75)
+    for r in rows:
+        iid, port, proto, remark, tag, strat, saddr = r
+        print(f"{iid:<4} {port:<7} {proto:<8} {str(remark):<18} {str(strat):<15} {str(saddr or '(default)')}")
+
+except Exception as e:
+    print(f"Error accessing database: {e}")
+    sys.exit(1)
+EOF
+
+    echo ""
+    read -rp "Enter Inbound ID to set Iran IP for (e.g. 9) [or 'all' for all inbounds]: " target_id
+    if [[ -z "$target_id" ]]; then
+        return 0
+    fi
+
+    read -rp "Enter Iran Server IP (to show in Subscription links): " iran_ip
+    while [[ -z "$iran_ip" ]]; do
+        warn "Iran Server IP cannot be empty!"
+        read -rp "Enter Iran Server IP: " iran_ip
+    done
+
+    python3 - << EOF
+import sqlite3
+import subprocess
+
+db_path = "/etc/x-ui/x-ui.db"
+target_id = "${target_id}".strip()
+iran_ip = "${iran_ip}".strip()
+
+conn = sqlite3.connect(db_path)
+c = conn.cursor()
+
+if target_id.lower() == 'all':
+    c.execute("UPDATE inbounds SET share_addr_strategy = 'custom', share_addr = ? WHERE enable = 1", (iran_ip,))
+    print(f"[+] Updated all active inbounds to Custom Share Address: {iran_ip}")
+else:
+    try:
+        iid = int(target_id)
+        c.execute("UPDATE inbounds SET share_addr_strategy = 'custom', share_addr = ? WHERE id = ?", (iran_ip, iid))
+        print(f"[+] Updated Inbound {iid} to Custom Share Address: {iran_ip}")
+    except ValueError:
+        print("[!] Invalid Inbound ID.")
+
+# Verify client_inbounds integrity so clients are never dropped
+c.execute("SELECT id FROM inbounds WHERE enable = 1")
+inbound_ids = [r[0] for r in c.fetchall()]
+
+c.execute("SELECT client_id, flow_override, created_at FROM client_inbounds WHERE inbound_id = 1")
+master_clients = c.fetchall()
+
+added_count = 0
+for target_ib in inbound_ids:
+    if target_ib == 1:
+        continue
+    for cid, flow, cat in master_clients:
+        exists = c.execute("SELECT 1 FROM client_inbounds WHERE client_id = ? AND inbound_id = ?", (cid, target_ib)).fetchone()
+        if not exists:
+            c.execute("INSERT INTO client_inbounds (client_id, inbound_id, flow_override, created_at) VALUES (?, ?, ?, ?)", (cid, target_ib, flow or '', cat))
+            added_count += 1
+
+if added_count > 0:
+    print(f"[+] Synchronized {added_count} client authorization entries across inbounds.")
+
+conn.commit()
+conn.close()
+
+# Restart x-ui safely
+try:
+    subprocess.run(["systemctl", "restart", "x-ui"], check=True)
+    print("[+] Restarted x-ui service cleanly.")
+except Exception as e:
+    print(f"[!] Warning: Could not restart x-ui automatically: {e}")
+EOF
+
+    echo ""
+    success "3X-UI Subscription configuration updated successfully!"
+    echo "When clients update their subscription links, they will directly receive Iran IP: ${iran_ip}"
+    read -rp "Press Enter to return to menu..."
+}
+
+# ------------------------------------------------------------------------------
+# 5. FIREWALL HARDENING
+# ------------------------------------------------------------------------------
+harden_iran_firewall() {
+    local allowed_ports=("$@")
+    title "Hardening Iran Server Firewall (UFW)"
+
+    # Detect SSH Port
+    local ssh_port="22"
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        local found_p
+        found_p=$(grep -E "^Port [0-9]+" /etc/ssh/sshd_config | awk '{print $2}' || echo "22")
+        [[ -n "$found_p" ]] && ssh_port="$found_p"
+    fi
+
+    info "Configuring UFW rules..."
+    ufw --force reset >/dev/null 2>&1
+    ufw default deny incoming >/dev/null 2>&1
+    ufw default allow outgoing >/dev/null 2>&1
+
+    info "Allowing SSH management on port ${ssh_port}/tcp..."
+    ufw allow "${ssh_port}/tcp" >/dev/null 2>&1
+
+    for p in "${allowed_ports[@]}"; do
+        info "Allowing tunnel traffic on port ${p} (TCP/UDP)..."
+        ufw allow "${p}/tcp" >/dev/null 2>&1
+        ufw allow "${p}/udp" >/dev/null 2>&1
+    done
+
+    echo "y" | ufw enable >/dev/null 2>&1
+    success "UFW Firewall locked down successfully!"
+    echo "Only SSH (${ssh_port}/tcp) and forwarded ports (${allowed_ports[*]}) are accessible."
+}
+
+firewall_menu() {
+    title "Firewall Security & Optimizer (UFW)"
+    echo "  1) Harden Iran Server (Deny all incoming except SSH & Tunnel Ports)"
+    echo "  2) Restrict Foreign Server Tunnel Port to Iran IP Only"
+    echo "  3) View Current Firewall Rules"
+    echo "  4) Reset / Disable Firewall"
+    echo "  0) Back to Main Menu"
+    read -rp "Select option [0-4]: " fopt
+
+    case "$fopt" in
+        1)
+            read -rp "Enter ports to keep open (e.g. 8443, 443): " ports_in
+            IFS=',' read -ra P_LIST <<< "$ports_in"
+            local clean_p=()
+            for p in "${P_LIST[@]}"; do
+                p=$(echo "$p" | tr -d ' ')
+                [[ "$p" =~ ^[0-9]+$ ]] && clean_p+=("$p")
+            done
+            harden_iran_firewall "${clean_p[@]}"
+            read -rp "Press Enter to continue..."
+            ;;
+        2)
+            read -rp "Enter Tunnel Port on Foreign Server (e.g. 28030): " t_port
+            read -rp "Enter Iran Server IP to whitelist: " i_ip
+            if [[ -n "$t_port" && -n "$i_ip" ]]; then
+                ufw allow from "$i_ip" to any port "$t_port" proto tcp
+                ufw allow from "$i_ip" to any port "$t_port" proto udp
+                success "Foreign tunnel port ${t_port} is now restricted exclusively to Iran IP: ${i_ip}"
+            fi
+            read -rp "Press Enter to continue..."
+            ;;
+        3)
+            echo ""
+            ufw status verbose
+            echo ""
+            read -rp "Press Enter to continue..."
+            ;;
+        4)
+            ufw disable
+            warn "UFW Firewall disabled."
+            read -rp "Press Enter to continue..."
+            ;;
+        *) return 0 ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------
+# 6. BENCHMARK: SPEED, PING & JITTER
+# ------------------------------------------------------------------------------
+run_benchmark() {
+    title "Tunnel Performance & Quality Benchmark"
+    install_deps
+
+    python3 - << 'EOF'
+import time
+import urllib.request
+import json
+import sys
+
+print("[*] Performing live network quality and speed test...")
+
+# 1. Direct Ping & Latency (10 samples)
+endpoints = [
+    ("Google CDN", "https://www.google.com/generate_204"),
+    ("Cloudflare CDN", "https://1.1.1.1/cdn-cgi/trace")
+]
+
+for label, url in endpoints:
+    latencies = []
+    for _ in range(5):
+        t0 = time.time()
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                resp.read()
+                latencies.append((time.time() - t0) * 1000)
+        except Exception:
+            pass
+        time.sleep(0.1)
+
+    if latencies:
+        avg_lat = sum(latencies) / len(latencies)
+        min_lat = min(latencies)
+        max_lat = max(latencies)
+        jitter = sum(abs(latencies[i] - latencies[i-1]) for i in range(1, len(latencies))) / max(1, (len(latencies) - 1))
+        print(f" [+] {label:<15}: Avg={avg_lat:.1f}ms | Min={min_lat:.1f}ms | Max={max_lat:.1f}ms | Jitter={jitter:.1f}ms")
+
+# 2. Download Speed Test (15 MB payload)
+print("\n[*] Measuring Download Throughput (Cloudflare Edge CDN)...")
+try:
+    dl_size = 15 * 1024 * 1024
+    t0 = time.time()
+    req = urllib.request.Request(f"https://speed.cloudflare.com/__down?bytes={dl_size}", headers={'User-Agent': 'Mozilla/5.0'})
+    total_bytes = 0
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        while True:
+            chunk = resp.read(131072)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+    elapsed = time.time() - t0
+    mbps = (total_bytes * 8) / (elapsed * 1000 * 1000)
+    print(f" [+] Download Speed: {mbps:.2f} Mbps ({(total_bytes/(1024*1024))/elapsed:.2f} MB/s) | {total_bytes/(1024*1024):.1f} MB in {elapsed:.2f}s")
+except Exception as e:
+    print(f" [!] Download test error: {e}")
+
+# 3. Upload Speed Test (5 MB payload)
+print("\n[*] Measuring Upload Throughput (Cloudflare Edge CDN)...")
+try:
+    up_data = b"0" * (5 * 1024 * 1024)
+    t0 = time.time()
+    req = urllib.request.Request("https://speed.cloudflare.com/__up", data=up_data, headers={'User-Agent': 'Mozilla/5.0'}, method='POST')
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        resp.read()
+    elapsed = time.time() - t0
+    mbps = (len(up_data) * 8) / (elapsed * 1000 * 1000)
+    print(f" [+] Upload Speed:   {mbps:.2f} Mbps ({(len(up_data)/(1024*1024))/elapsed:.2f} MB/s) | {len(up_data)/(1024*1024):.1f} MB in {elapsed:.2f}s")
+except Exception as e:
+    print(f" [!] Upload test error: {e}")
+
+print("\n[+] Benchmark finished successfully.")
+EOF
+
+    echo ""
+    read -rp "Press Enter to return to menu..."
+}
+
+# ------------------------------------------------------------------------------
+# 7. SERVICE CONTROL & DIAGNOSTICS
+# ------------------------------------------------------------------------------
+service_control() {
+    title "Service Control & Diagnostics"
+    echo "  1) Check Status of TunnelForge Services"
+    echo "  2) View Realtime Live Logs"
+    echo "  3) Restart TunnelForge Services"
+    echo "  4) Stop TunnelForge Services"
+    echo "  5) Check Listening Network Ports (ss/netstat)"
+    echo "  0) Back to Main Menu"
+    read -rp "Select option [0-5]: " sopt
+
+    case "$sopt" in
+        1)
+            echo ""
+            systemctl status "$SERVICE_SERVER" "$SERVICE_CLIENT" --no-pager 2>/dev/null || true
+            echo ""
+            read -rp "Press Enter to continue..."
+            ;;
+        2)
+            echo "Streaming live logs (Press Ctrl+C to exit)..."
+            journalctl -u "$SERVICE_SERVER" -u "$SERVICE_CLIENT" -f
+            ;;
+        3)
+            systemctl restart "$SERVICE_SERVER" 2>/dev/null || true
+            systemctl restart "$SERVICE_CLIENT" 2>/dev/null || true
+            success "Services restarted."
+            read -rp "Press Enter to continue..."
+            ;;
+        4)
+            systemctl stop "$SERVICE_SERVER" 2>/dev/null || true
+            systemctl stop "$SERVICE_CLIENT" 2>/dev/null || true
+            warn "Services stopped."
+            read -rp "Press Enter to continue..."
+            ;;
+        5)
+            echo ""
+            if command -v ss >/dev/null 2>&1; then
+                ss -tulpn | grep -E "gost|xray|x-ui" || ss -tulpn
+            else
+                netstat -tulpn
+            fi
+            echo ""
+            read -rp "Press Enter to continue..."
+            ;;
+        *) return 0 ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------
+# 8. UPDATE CORE (GOST & TUNNELFORGE)
+# ------------------------------------------------------------------------------
+update_core() {
+    title "Update Core & Scripts"
+    rm -f "$GOST_BIN"
+    install_gost
+
+    info "Updating TunnelForge CLI script from GitHub..."
+    local script_url="https://raw.githubusercontent.com/armanpier/TunnelForge/main/tunnelforge"
+    if curl -sSL "$script_url" -o "$0"; then
+        chmod +x "$0"
+        success "TunnelForge updated to latest version successfully!"
+    else
+        warn "Could not fetch latest script directly from GitHub."
+    fi
+
+    # Restart services if active
+    systemctl restart "$SERVICE_SERVER" 2>/dev/null || true
+    systemctl restart "$SERVICE_CLIENT" 2>/dev/null || true
+    read -rp "Press Enter to return to menu..."
+}
+
+# ------------------------------------------------------------------------------
+# 9. UNINSTALL TUNNELFORGE
+# ------------------------------------------------------------------------------
+uninstall_tunnelforge() {
+    title "Uninstall TunnelForge"
+    read -rp "Are you sure you want to completely uninstall TunnelForge? [y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        info "Uninstallation canceled."
+        return 0
+    fi
+
+    info "Stopping and disabling services..."
+    systemctl stop "$SERVICE_SERVER" "$SERVICE_CLIENT" 2>/dev/null || true
+    systemctl disable "$SERVICE_SERVER" "$SERVICE_CLIENT" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${SERVICE_SERVER}" "/etc/systemd/system/${SERVICE_CLIENT}"
+    systemctl daemon-reload
+
+    info "Removing configuration and binaries..."
+    rm -rf "$CONF_DIR"
+    rm -f "$GOST_BIN"
+    rm -f "/usr/local/bin/tunnelforge" "/usr/local/bin/tunnel"
+
+    success "TunnelForge has been completely uninstalled from this server."
+    exit 0
+}
+
+# ------------------------------------------------------------------------------
+# MAIN INTERACTIVE MENU
+# ------------------------------------------------------------------------------
+main_menu() {
+    check_root
+
+    while true; do
+        show_banner
+
+        # Check Active Role / Status
+        local s_srv="inactive"
+        local s_cli="inactive"
+        systemctl is-active "$SERVICE_SERVER" >/dev/null 2>&1 && s_srv="${C_GREEN}active (running)${C_RESET}" || s_srv="${C_DIM}inactive${C_RESET}"
+        systemctl is-active "$SERVICE_CLIENT" >/dev/null 2>&1 && s_cli="${C_GREEN}active (running)${C_RESET}" || s_cli="${C_DIM}inactive${C_RESET}"
+
+        echo -e " Service Status: Server [${s_srv}] | Client [${s_cli}]"
+        echo -e "${C_CYAN}------------------------------------------------------------------------${C_RESET}"
+        echo -e "  ${C_BOLD}[1]${C_RESET} Setup Foreign Server        ${C_DIM}(Tunnel Exit / Server Mode)${C_RESET}"
+        echo -e "  ${C_BOLD}[2]${C_RESET} Setup Iran Server           ${C_DIM}(Bridge / Forwarder Mode)${C_RESET}"
+        echo -e "  ${C_BOLD}[3]${C_RESET} Manage Forwarded Ports      ${C_DIM}(Add/Remove Forwarded Ports)${C_RESET}"
+        echo -e "  ${C_BOLD}[4]${C_RESET} 3X-UI / X-UI Subscription   ${C_DIM}(Set Custom Share Address to Iran IP)${C_RESET}"
+        echo -e "  ${C_BOLD}[5]${C_RESET} Firewall Security (UFW)     ${C_DIM}(1-Click Lockdown & Port Rules)${C_RESET}"
+        echo -e "  ${C_BOLD}[6]${C_RESET} Run Network Benchmark       ${C_DIM}(Latency, Jitter, Download, Upload)${C_RESET}"
+        echo -e "  ${C_BOLD}[7]${C_RESET} Service Control             ${C_DIM}(Status, Logs, Restart, Port Check)${C_RESET}"
+        echo -e "  ${C_BOLD}[8]${C_RESET} Update GOST Core & CLI      ${C_DIM}(Upgrade to latest release)${C_RESET}"
+        echo -e "  ${C_BOLD}[9]${C_RESET} Uninstall TunnelForge       ${C_DIM}(Clean removal)${C_RESET}"
+        echo -e "  ${C_BOLD}[0]${C_RESET} Exit"
+        echo -e "${C_CYAN}------------------------------------------------------------------------${C_RESET}"
+        read -rp "Enter choice [0-9]: " choice
+
+        case "$choice" in
+            1) setup_foreign_server ;;
+            2) setup_iran_client ;;
+            3) manage_ports ;;
+            4) sync_xui_subscription ;;
+            5) firewall_menu ;;
+            6) run_benchmark ;;
+            7) service_control ;;
+            8) update_core ;;
+            9) uninstall_tunnelforge ;;
+            0)
+                echo -e "\nGoodbye!"
+                exit 0
+                ;;
+            *)
+                warn "Invalid selection."
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# Run
+main_menu "$@"
